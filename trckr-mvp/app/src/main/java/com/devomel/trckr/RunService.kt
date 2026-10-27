@@ -13,12 +13,14 @@ import android.content.pm.ServiceInfo
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import java.io.BufferedWriter
 import java.io.File
+import java.util.Collections
 import java.util.Locale
 
 /** Foreground service that records one run: GPS + heart rate, 1 row per second. */
@@ -37,6 +39,17 @@ class RunService : Service(), LocationListener {
         @Volatile var startedAt = 0L
         @Volatile var distanceM = 0.0
         @Volatile var lastLocation: Location? = null
+        /** Accepted track points (lat, lon) for the live map. */
+        val track: MutableList<DoubleArray> = Collections.synchronizedList(ArrayList())
+
+        /** GPS plus, where available, the fused provider for a faster first fix. */
+        fun providers(lm: LocationManager): List<String> {
+            val p = mutableListOf(LocationManager.GPS_PROVIDER)
+            if (Build.VERSION.SDK_INT >= 31 && lm.allProviders.contains(LocationManager.FUSED_PROVIDER)) {
+                p += LocationManager.FUSED_PROVIDER
+            }
+            return p
+        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -80,6 +93,7 @@ class RunService : Service(), LocationListener {
         startedAt = System.currentTimeMillis()
         distanceM = 0.0
         lastAccepted = null
+        track.clear()
         lastWrittenFixTime = 0L
         ticks = 0
         running = true
@@ -87,8 +101,8 @@ class RunService : Service(), LocationListener {
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "trckr:run").apply { acquire(6 * 60 * 60 * 1000L) }
 
-        getSystemService(LocationManager::class.java)
-            .requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this, Looper.getMainLooper())
+        val lm = getSystemService(LocationManager::class.java)
+        for (p in providers(lm)) lm.requestLocationUpdates(p, 1000L, 0f, this, Looper.getMainLooper())
 
         getSharedPreferences("trckr", MODE_PRIVATE).getString("hr_address", null)?.let {
             HrMonitor.connect(this, it)
@@ -164,6 +178,7 @@ class RunService : Service(), LocationListener {
         val prev = lastAccepted
         if (prev == null) {
             lastAccepted = loc
+            track.add(doubleArrayOf(loc.latitude, loc.longitude))
             return
         }
         // Skip jitter: only count movement larger than the noise.
@@ -171,6 +186,7 @@ class RunService : Service(), LocationListener {
         if (d >= maxOf(3f, loc.accuracy / 2f)) {
             distanceM += d
             lastAccepted = loc
+            track.add(doubleArrayOf(loc.latitude, loc.longitude))
         }
     }
 

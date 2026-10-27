@@ -32,6 +32,13 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -61,11 +68,37 @@ class MainActivity : Activity(), LocationListener {
     private lateinit var btnHr: Button
     private lateinit var btnRun: Button
     private lateinit var listView: ListView
+    private lateinit var map: MapView
+    private lateinit var trackLine: Polyline
+    private lateinit var meMarker: Marker
+    private var drawnPoints = -1
+    private var centeredOnce = false
     private var sessions: List<SessionStore.Summary> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val pad = (16 * resources.displayMetrics.density).toInt()
+
+        Configuration.getInstance().apply {
+            userAgentValue = packageName
+            osmdroidBasePath = File(filesDir, "osmdroid")
+            osmdroidTileCache = File(cacheDir, "osm-tiles")
+        }
+        map = MapView(this).apply {
+            setTileSource(TileSourceFactory.MAPNIK)
+            setMultiTouchControls(true)
+            controller.setZoom(16.0)
+            controller.setCenter(GeoPoint(50.4501, 30.5234))
+        }
+        trackLine = Polyline(map).apply {
+            outlinePaint.color = Color.rgb(220, 40, 40)
+            outlinePaint.strokeWidth = 10f
+        }
+        meMarker = Marker(map).apply {
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+            setOnMarkerClickListener { _, _ -> true }
+        }
+        map.overlays.add(trackLine)
 
         tvTime = TextView(this).apply {
             textSize = 48f
@@ -97,6 +130,7 @@ class MainActivity : Activity(), LocationListener {
             setPadding(pad, pad, pad, pad)
             addView(tvTime, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(tvStats, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+            addView(map, LinearLayout.LayoutParams(MATCH_PARENT, (260 * resources.displayMetrics.density).toInt()))
             addView(btnHr, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(btnRun, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(header, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
@@ -110,6 +144,7 @@ class MainActivity : Activity(), LocationListener {
 
     override fun onResume() {
         super.onResume()
+        map.onResume()
         prefs.getString("hr_address", null)?.let { HrMonitor.connect(this, it) }
         startGpsPreview()
         refreshHistory()
@@ -118,6 +153,7 @@ class MainActivity : Activity(), LocationListener {
 
     override fun onPause() {
         super.onPause()
+        map.onPause()
         handler.removeCallbacks(uiTick)
         stopGpsPreview()
     }
@@ -167,6 +203,7 @@ class MainActivity : Activity(), LocationListener {
         val hrLine = when {
             hrName == null -> "не вибрано"
             hr > 0 -> "$hr уд/хв"
+            HrMonitor.status.startsWith("пристрій без") -> "це не пульсометр — вибери інший"
             else -> HrMonitor.status
         }
 
@@ -189,15 +226,34 @@ class MainActivity : Activity(), LocationListener {
         }
         btnRun.setTextColor(Color.WHITE)
         btnHr.text = "Пульсометр: ${hrName ?: "вибрати…"}"
-        btnHr.isEnabled = !running
+        renderMap(running, loc)
+    }
+
+    private fun renderMap(running: Boolean, loc: Location?) {
+        val pts = if (running) synchronized(RunService.track) { RunService.track.toList() } else emptyList()
+        if (pts.size != drawnPoints) {
+            drawnPoints = pts.size
+            trackLine.setPoints(pts.map { GeoPoint(it[0], it[1]) })
+        }
+        if (loc != null) {
+            val p = GeoPoint(loc.latitude, loc.longitude)
+            meMarker.position = p
+            if (!map.overlays.contains(meMarker)) map.overlays.add(meMarker)
+            if (!centeredOnce) {
+                map.controller.setZoom(17.0)
+                centeredOnce = true
+            }
+            map.controller.setCenter(p)
+        }
+        map.invalidate()
     }
 
     // ---- GPS preview (warm up the fix before the start) ----
 
     private fun startGpsPreview() {
         if (listeningGps || !has(Manifest.permission.ACCESS_FINE_LOCATION)) return
-        getSystemService(LocationManager::class.java)
-            .requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this, Looper.getMainLooper())
+        val lm = getSystemService(LocationManager::class.java)
+        for (p in RunService.providers(lm)) lm.requestLocationUpdates(p, 1000L, 0f, this, Looper.getMainLooper())
         listeningGps = true
     }
 
@@ -290,15 +346,19 @@ class MainActivity : Activity(), LocationListener {
             } catch (_: Exception) {
             }
             progress.dismiss()
-            // HR straps first.
-            val items = found.entries.sortedByDescending { it.value.second }
+            // Only real HR straps if any were found; otherwise everything with a name.
+            val hrOnly = found.entries.filter { it.value.second }
+            val items = hrOnly.ifEmpty { found.entries.toList() }
             if (items.isEmpty()) {
                 Toast.makeText(this, "Нічого не знайдено", Toast.LENGTH_LONG).show()
                 return@postDelayed
             }
+            if (hrOnly.isEmpty()) {
+                Toast.makeText(this, "Пульсометр не знайдено — змочи контакти, одягни і спробуй ще", Toast.LENGTH_LONG).show()
+            }
             val labels = items.map { (addr, v) -> (if (v.second) "♥ " else "") + v.first + "  " + addr }
             AlertDialog.Builder(this)
-                .setTitle("Вибери пульсометр")
+                .setTitle(if (hrOnly.isEmpty()) "Пульсометрів не видно, усі пристрої:" else "Вибери пульсометр")
                 .setItems(labels.toTypedArray()) { _, i ->
                     val (addr, v) = items[i]
                     prefs.edit().putString("hr_address", addr).putString("hr_name", v.first).apply()

@@ -11,8 +11,8 @@ android {
         applicationId = "com.devomel.trckr"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
     }
 
     signingConfigs {
@@ -39,4 +39,9 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    // OpenStreetMap view, no API key needed.
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
 }
