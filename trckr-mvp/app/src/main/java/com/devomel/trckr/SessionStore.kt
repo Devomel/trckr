@@ -77,11 +77,13 @@ object SessionStore {
         return summary
     }
 
-    /** Copies GPX + CSV to Downloads/trckr. Returns a human-readable location. */
+    /** Copies CSV (and GPX for old sessions with GPS) to Downloads/trckr. Returns a human-readable location. */
     fun export(ctx: Context, id: String): String {
         val dir = File(root(ctx), id)
-        if (!File(dir, "track.gpx").exists()) finalize(dir)
-        for ((name, mime) in listOf("track.gpx" to "application/gpx+xml", "track.csv" to "text/csv")) {
+        val summary = finalize(dir)
+        val files = mutableListOf("track.csv" to "text/csv")
+        if ((summary?.gpsPoints ?: 0) > 0) files += "track.gpx" to "application/gpx+xml"
+        for ((name, mime) in files) {
             val src = File(dir, name)
             if (!src.exists()) continue
             val values = ContentValues().apply {
@@ -95,7 +97,7 @@ object SessionStore {
                 src.inputStream().use { it.copyTo(out) }
             }
         }
-        return "Download/trckr/run_$id.gpx"
+        return "Download/trckr/run_$id.csv"
     }
 
     private class Row(

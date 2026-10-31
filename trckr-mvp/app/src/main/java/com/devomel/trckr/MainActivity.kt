@@ -12,9 +12,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
-import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -32,13 +29,6 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
-import org.osmdroid.config.Configuration
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory
-import org.osmdroid.util.GeoPoint
-import org.osmdroid.views.MapView
-import org.osmdroid.views.overlay.Marker
-import org.osmdroid.views.overlay.Polyline
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -46,59 +36,26 @@ import java.util.Locale
 object Format {
     fun duration(sec: Long): String =
         String.format(Locale.US, "%d:%02d:%02d", sec / 3600, (sec % 3600) / 60, sec % 60)
-
-    fun pace(secPerKm: Double): String {
-        if (secPerKm.isNaN() || secPerKm.isInfinite() || secPerKm <= 0 || secPerKm > 3600) return "--:--"
-        val s = secPerKm.toLong()
-        return String.format(Locale.US, "%d:%02d", s / 60, s % 60)
-    }
 }
 
-/** Deliberately minimal UI: one screen with live stats, start/stop and history. */
+/** Deliberately minimal UI: one screen with live time + heart rate, start/stop and history. */
 @SuppressLint("MissingPermission", "SetTextI18n")
-class MainActivity : Activity(), LocationListener {
+class MainActivity : Activity() {
 
     private val prefs by lazy { getSharedPreferences("trckr", MODE_PRIVATE) }
     private val handler = Handler(Looper.getMainLooper())
-    private var previewLocation: Location? = null
-    private var listeningGps = false
 
     private lateinit var tvTime: TextView
+    private lateinit var tvHr: TextView
     private lateinit var tvStats: TextView
     private lateinit var btnHr: Button
     private lateinit var btnRun: Button
     private lateinit var listView: ListView
-    private lateinit var map: MapView
-    private lateinit var trackLine: Polyline
-    private lateinit var meMarker: Marker
-    private var drawnPoints = -1
-    private var centeredOnce = false
     private var sessions: List<SessionStore.Summary> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val pad = (16 * resources.displayMetrics.density).toInt()
-
-        Configuration.getInstance().apply {
-            userAgentValue = packageName
-            osmdroidBasePath = File(filesDir, "osmdroid")
-            osmdroidTileCache = File(cacheDir, "osm-tiles")
-        }
-        map = MapView(this).apply {
-            setTileSource(TileSourceFactory.MAPNIK)
-            setMultiTouchControls(true)
-            controller.setZoom(16.0)
-            controller.setCenter(GeoPoint(50.4501, 30.5234))
-        }
-        trackLine = Polyline(map).apply {
-            outlinePaint.color = Color.rgb(220, 40, 40)
-            outlinePaint.strokeWidth = 10f
-        }
-        meMarker = Marker(map).apply {
-            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-            setOnMarkerClickListener { _, _ -> true }
-        }
-        map.overlays.add(trackLine)
 
         tvTime = TextView(this).apply {
             textSize = 48f
@@ -106,8 +63,14 @@ class MainActivity : Activity(), LocationListener {
             gravity = Gravity.CENTER
             text = "0:00:00"
         }
+        tvHr = TextView(this).apply {
+            textSize = 64f
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(200, 40, 40))
+        }
         tvStats = TextView(this).apply {
             textSize = 18f
+            gravity = Gravity.CENTER
             setPadding(0, pad / 2, 0, pad / 2)
         }
         btnHr = Button(this).apply { setOnClickListener { scanHr() } }
@@ -129,8 +92,8 @@ class MainActivity : Activity(), LocationListener {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
             addView(tvTime, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+            addView(tvHr, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(tvStats, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-            addView(map, LinearLayout.LayoutParams(MATCH_PARENT, (260 * resources.displayMetrics.density).toInt()))
             addView(btnHr, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(btnRun, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(header, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
@@ -144,18 +107,14 @@ class MainActivity : Activity(), LocationListener {
 
     override fun onResume() {
         super.onResume()
-        map.onResume()
         prefs.getString("hr_address", null)?.let { HrMonitor.connect(this, it) }
-        startGpsPreview()
         refreshHistory()
         handler.post(uiTick)
     }
 
     override fun onPause() {
         super.onPause()
-        map.onPause()
         handler.removeCallbacks(uiTick)
-        stopGpsPreview()
     }
 
     override fun onDestroy() {
@@ -165,21 +124,26 @@ class MainActivity : Activity(), LocationListener {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        startGpsPreview()
         prefs.getString("hr_address", null)?.let { HrMonitor.connect(this, it) }
     }
 
     private fun neededPermissions(): Array<String> {
-        val p = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        val p = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 31) {
             p += Manifest.permission.BLUETOOTH_SCAN
             p += Manifest.permission.BLUETOOTH_CONNECT
+        } else {
+            // Android 10/11 only allow BLE scanning with location permission.
+            p += Manifest.permission.ACCESS_FINE_LOCATION
         }
         if (Build.VERSION.SDK_INT >= 33) p += Manifest.permission.POST_NOTIFICATIONS
         return p.toTypedArray()
     }
 
     private fun has(p: String) = checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasBluetooth() = Build.VERSION.SDK_INT < 31 ||
+        (has(Manifest.permission.BLUETOOTH_SCAN) && has(Manifest.permission.BLUETOOTH_CONNECT))
 
     // ---- live UI ----
 
@@ -192,91 +156,39 @@ class MainActivity : Activity(), LocationListener {
 
     private fun render() {
         val running = RunService.running
-        val loc = if (running) RunService.lastLocation else previewLocation
-        val gps = when {
-            !has(Manifest.permission.ACCESS_FINE_LOCATION) -> "немає дозволу"
-            loc == null || System.currentTimeMillis() - loc.time > 10_000 -> "шукаю супутники…"
-            else -> String.format(Locale.US, "±%.0f м%s", loc.accuracy, if (loc.accuracy <= 15) " ✓" else " (зачекай)")
-        }
         val hr = HrMonitor.freshBpm()
         val hrName = prefs.getString("hr_name", null)
-        val hrLine = when {
-            hrName == null -> "не вибрано"
-            hr > 0 -> "$hr уд/хв"
+
+        tvHr.text = if (hr > 0) "♥ $hr" else "♥ --"
+        val status = when {
+            hrName == null -> "Пульсометр не вибрано"
+            hr > 0 -> "уд/хв"
             HrMonitor.status.startsWith("пристрій без") -> "це не пульсометр — вибери інший"
             else -> HrMonitor.status
         }
 
         if (running) {
             val sec = (System.currentTimeMillis() - RunService.startedAt) / 1000
-            val km = RunService.distanceM / 1000.0
-            val curPace = if (loc != null && loc.hasSpeed() && loc.speed > 0.5f) 1000.0 / loc.speed else Double.NaN
             tvTime.text = Format.duration(sec)
-            tvStats.text = String.format(Locale.US, "Дистанція: %.2f км\n", km) +
-                "Темп зараз: ${Format.pace(curPace)} /км\n" +
-                "Темп середній: ${Format.pace(if (km > 0.05) sec / km else Double.NaN)} /км\n" +
-                "Пульс: $hrLine\nGPS: $gps"
+            val avg = RunService.avgHr()
+            tvStats.text = "$status\nСередній: ${if (avg > 0) avg else "-"}   Макс: ${if (RunService.hrMax > 0) RunService.hrMax else "-"}"
             btnRun.text = "■ СТОП"
             btnRun.setBackgroundColor(Color.rgb(200, 40, 40))
         } else {
             tvTime.text = "0:00:00"
-            tvStats.text = "Пульс: $hrLine\nGPS: $gps"
+            tvStats.text = status
             btnRun.text = "▶ СТАРТ"
             btnRun.setBackgroundColor(Color.rgb(30, 150, 60))
         }
         btnRun.setTextColor(Color.WHITE)
         btnHr.text = "Пульсометр: ${hrName ?: "вибрати…"}"
-        renderMap(running, loc)
     }
-
-    private fun renderMap(running: Boolean, loc: Location?) {
-        val pts = if (running) synchronized(RunService.track) { RunService.track.toList() } else emptyList()
-        if (pts.size != drawnPoints) {
-            drawnPoints = pts.size
-            trackLine.setPoints(pts.map { GeoPoint(it[0], it[1]) })
-        }
-        if (loc != null) {
-            val p = GeoPoint(loc.latitude, loc.longitude)
-            meMarker.position = p
-            if (!map.overlays.contains(meMarker)) map.overlays.add(meMarker)
-            if (!centeredOnce) {
-                map.controller.setZoom(17.0)
-                centeredOnce = true
-            }
-            map.controller.setCenter(p)
-        }
-        map.invalidate()
-    }
-
-    // ---- GPS preview (warm up the fix before the start) ----
-
-    private fun startGpsPreview() {
-        if (listeningGps || !has(Manifest.permission.ACCESS_FINE_LOCATION)) return
-        val lm = getSystemService(LocationManager::class.java)
-        for (p in RunService.providers(lm)) lm.requestLocationUpdates(p, 1000L, 0f, this, Looper.getMainLooper())
-        listeningGps = true
-    }
-
-    private fun stopGpsPreview() {
-        if (!listeningGps) return
-        getSystemService(LocationManager::class.java).removeUpdates(this)
-        listeningGps = false
-    }
-
-    override fun onLocationChanged(location: Location) {
-        previewLocation = location
-    }
-
-    @Deprecated("Deprecated in Java")
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-    override fun onProviderEnabled(provider: String) {}
-    override fun onProviderDisabled(provider: String) {}
 
     // ---- run control ----
 
     private fun startRun() {
-        if (!has(Manifest.permission.ACCESS_FINE_LOCATION)) {
-            Toast.makeText(this, "Потрібен дозвіл на геолокацію", Toast.LENGTH_LONG).show()
+        if (!hasBluetooth()) {
+            Toast.makeText(this, "Потрібен дозвіл на Bluetooth", Toast.LENGTH_LONG).show()
             requestPermissions(neededPermissions(), 1)
             return
         }
@@ -313,9 +225,7 @@ class MainActivity : Activity(), LocationListener {
     // ---- HR strap selection ----
 
     private fun scanHr() {
-        if (Build.VERSION.SDK_INT >= 31 &&
-            (!has(Manifest.permission.BLUETOOTH_SCAN) || !has(Manifest.permission.BLUETOOTH_CONNECT))
-        ) {
+        if (!hasBluetooth()) {
             requestPermissions(neededPermissions(), 1)
             return
         }
@@ -375,27 +285,21 @@ class MainActivity : Activity(), LocationListener {
         sessions = SessionStore.list(this, RunService.sessionId)
         val df = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.US)
         val rows = sessions.map {
-            val km = it.distanceM / 1000.0
-            String.format(
-                Locale.US, "%s   %.2f км   %s   %s",
-                df.format(Date(it.startMs)), km, Format.duration(it.durationS),
-                if (it.avgHr > 0) "♥ ${it.avgHr}" else ""
-            )
+            df.format(Date(it.startMs)) + "   " + Format.duration(it.durationS) +
+                (if (it.avgHr > 0) "   ♥ ${it.avgHr} / ${it.maxHr}" else "")
         }
         listView.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, rows)
     }
 
     private fun showSession(s: SessionStore.Summary) {
         val df = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.US)
-        val km = s.distanceM / 1000.0
-        val msg = String.format(Locale.US, "Старт: %s\nЧас: %s\nДистанція: %.2f км\n", df.format(Date(s.startMs)), Format.duration(s.durationS), km) +
-            "Середній темп: ${Format.pace(if (km > 0.05) s.durationS / km else Double.NaN)} /км\n" +
-            "Пульс: середній ${if (s.avgHr > 0) s.avgHr else "-"}, макс ${if (s.maxHr > 0) s.maxHr else "-"}\n" +
-            "GPS точок: ${s.gpsPoints}"
+        val msg = "Старт: ${df.format(Date(s.startMs))}\n" +
+            "Час: ${Format.duration(s.durationS)}\n" +
+            "Пульс: середній ${if (s.avgHr > 0) s.avgHr else "-"}, макс ${if (s.maxHr > 0) s.maxHr else "-"}"
         AlertDialog.Builder(this)
             .setTitle("Тренування ${s.id}")
             .setMessage(msg)
-            .setPositiveButton("Експорт GPX") { _, _ ->
+            .setPositiveButton("Експорт") { _, _ ->
                 try {
                     val where = SessionStore.export(this, s.id)
                     Toast.makeText(this, "Збережено: $where", Toast.LENGTH_LONG).show()
